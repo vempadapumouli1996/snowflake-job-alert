@@ -67,7 +67,7 @@ if sys.platform == "win32":
 
 SENDGRID_API_KEY  = os.environ.get("SENDGRID_API_KEY", "")  # Set this in Railway Variables
 EMAIL_TO          = "vempadapumouli96@gmail.com"
-EMAIL_FROM        = "vempadapumouli96@gmail.com"
+EMAIL_FROM        = "snowflakejobsalert@gmail.com"
 
 # Keywords to match — scans BOTH job title AND description
 KEYWORDS          = ["snowflake"]
