@@ -65,9 +65,9 @@ if sys.platform == "win32":
 #  ⚙️  CONFIG — ONLY THING YOU NEED TO FILL IN
 # ══════════════════════════════════════════════════════════════════
 
-SENDGRID_API_KEY  = "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"   # sendgrid.com → free
+SENDGRID_API_KEY  = os.environ.get("SENDGRID_API_KEY", "")  # Set this in Railway Variables
 EMAIL_TO          = "vempadapumouli96@gmail.com"
-EMAIL_FROM        = "alerts@sendgrid.net"
+EMAIL_FROM        = "vempadapumouli96@gmail.com"
 
 # Keywords to match — scans BOTH job title AND description
 KEYWORDS          = ["snowflake"]
@@ -143,9 +143,7 @@ def matches(text: str) -> bool:
 #  EMAIL ALERT  (beautiful HTML, works on all email clients)
 # ══════════════════════════════════════════════════════════════════
 def send_alert(company: str, title: str, url: str, source: str, location: str = ""):
-    from sendgrid import SendGridAPIClient
-    from sendgrid.helpers.mail import Mail
-
+    import httpx
     ts = datetime.utcnow().strftime("%b %d, %Y at %H:%M UTC")
 
     source_colors = {
@@ -243,20 +241,39 @@ def send_alert(company: str, title: str, url: str, source: str, location: str = 
 </html>"""
 
     try:
-        msg = Mail(
-            from_email=EMAIL_FROM,
-            to_emails=EMAIL_TO,
-            subject=f"🚨 {title} @ {company} [{source}]",
-            html_content=html
-        )
-        SendGridAPIClient(SENDGRID_API_KEY).send(msg)
-        log.info(f"📧 ALERT → {title} @ {company} [{source}]")
+        import httpx
+        payload = {
+            "personalizations": [{"to": [{"email": EMAIL_TO}]}],
+            "from": {"email": EMAIL_FROM},
+            "subject": f"Snowflake Job Alert: {title} @ {company} [{source}]",
+            "content": [{"type": "text/html", "value": html}]
+        }
+        with httpx.Client(verify=False) as client:
+            resp = client.post(
+                "https://api.sendgrid.com/v3/mail/send",
+                headers={
+                    "Authorization": f"Bearer {SENDGRID_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+                timeout=15
+            )
+        if resp.status_code in (200, 202):
+            log.info(f"ALERT SENT -> {title} @ {company} [{source}]")
+        else:
+            log.error(f"Email failed ({company}): {resp.status_code} {resp.text[:100]}")
     except Exception as e:
         log.error(f"Email error ({company}): {e}")
 
 def handle_job(key, company, title, url, source, location=""):
-    if is_new(key):
-        send_alert(company, title, url, source, location)
+    # Save to seen FIRST — prevents duplicates even if email fails
+    with _lock:
+        if key in seen_jobs:
+            return
+        seen_jobs.add(key)
+        _save_seen()
+    # Send email outside the lock
+    send_alert(company, title, url, source, location)
 
 # ══════════════════════════════════════════════════════════════════
 #  COMPANY DISCOVERY — Auto-discovers ALL companies per ATS
@@ -592,8 +609,39 @@ def get_companies():
 #  ATS SCANNERS — One per platform
 # ══════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════
+#  ATS SCANNERS — One per platform
+#  Only alerts for jobs posted in last 24 hours
+# ══════════════════════════════════════════════════════════════════
+
+def is_recent(timestamp_ms=None, timestamp_str=None, hours=24):
+    """
+    Returns True if the job was posted within the last `hours` hours.
+    Accepts either a Unix timestamp in milliseconds or an ISO date string.
+    If no date is available, returns True (don't filter out unknown dates).
+    """
+    from datetime import timezone
+    try:
+        now = datetime.now(timezone.utc)
+        if timestamp_ms:
+            posted = datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=timezone.utc)
+            return (now - posted).total_seconds() < hours * 3600
+        if timestamp_str:
+            # Handle formats: "2026-03-12T00:00:00Z", "2026-03-12", "2026-03-12T00:00:00.000Z"
+            ts = timestamp_str.replace("Z", "+00:00").replace(".000+", "+")
+            if "T" in ts:
+                posted = datetime.fromisoformat(ts)
+            else:
+                posted = datetime.fromisoformat(ts + "T00:00:00+00:00")
+            if posted.tzinfo is None:
+                posted = posted.replace(tzinfo=timezone.utc)
+            return (now - posted).total_seconds() < hours * 3600
+    except Exception:
+        pass
+    return True  # If we can't parse date, include it to be safe
+
 def scan_greenhouse(company: str):
-    """Greenhouse: official jobs API, includes full description content."""
+    """Greenhouse: official jobs API. Only alerts jobs posted in last 24h."""
     try:
         r = requests.get(
             f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs?content=true",
@@ -603,8 +651,11 @@ def scan_greenhouse(company: str):
         if r.status_code != 200:
             return
         for job in r.json().get("jobs", []):
-            title   = job.get("title", "")
-            content = job.get("content", "")
+            title    = job.get("title", "")
+            content  = job.get("content", "")
+            updated  = job.get("updated_at", "")    # ISO string e.g. "2026-03-12T10:00:00Z"
+            if not is_recent(timestamp_str=updated):
+                continue
             if matches(title) or matches(content):
                 handle_job(
                     f"gh_{company}_{job['id']}",
@@ -616,7 +667,7 @@ def scan_greenhouse(company: str):
         pass
 
 def scan_lever(company: str):
-    """Lever: public postings API, includes full description text."""
+    """Lever: public postings API. Only alerts jobs posted in last 24h."""
     try:
         r = requests.get(
             f"https://api.lever.co/v0/postings/{company}?mode=json",
@@ -626,8 +677,11 @@ def scan_lever(company: str):
         if r.status_code != 200 or not isinstance(r.json(), list):
             return
         for job in r.json():
-            title = job.get("text", "")
-            descr = job.get("descriptionPlain","") + " " + job.get("additionalPlain","")
+            title     = job.get("text", "")
+            descr     = job.get("descriptionPlain","") + " " + job.get("additionalPlain","")
+            created   = job.get("createdAt")          # Unix timestamp in milliseconds
+            if not is_recent(timestamp_ms=created):
+                continue
             if matches(title) or matches(descr):
                 handle_job(
                     f"lv_{company}_{job.get('id', title)}",
@@ -639,7 +693,7 @@ def scan_lever(company: str):
         pass
 
 def scan_smartrecruiters(company: str):
-    """SmartRecruiters: public postings API."""
+    """SmartRecruiters: public postings API. Only alerts jobs posted in last 24h."""
     try:
         r = requests.get(
             f"https://api.smartrecruiters.com/v1/companies/{company}/postings",
@@ -649,8 +703,11 @@ def scan_smartrecruiters(company: str):
         if r.status_code != 200:
             return
         for job in r.json().get("content", []):
-            title  = job.get("name", "")
-            job_id = job.get("id", "")
+            title    = job.get("name", "")
+            job_id   = job.get("id", "")
+            released = job.get("releasedDate", "")    # ISO string
+            if not is_recent(timestamp_str=released):
+                continue
             if matches(title):
                 handle_job(
                     f"sr_{company}_{job_id}",
@@ -662,7 +719,7 @@ def scan_smartrecruiters(company: str):
         pass
 
 def scan_ashby(company: str):
-    """Ashby: public job board API, includes description fields."""
+    """Ashby: public job board API. Only alerts jobs posted in last 24h."""
     try:
         r = requests.get(
             f"https://api.ashbyhq.com/posting-api/job-board/{company}",
@@ -672,8 +729,11 @@ def scan_ashby(company: str):
         if r.status_code != 200:
             return
         for job in r.json().get("jobs", []):
-            title = job.get("title", "")
-            descr = job.get("descriptionHtml","") + " " + job.get("descriptionSocial","")
+            title      = job.get("title", "")
+            descr      = job.get("descriptionHtml","") + " " + job.get("descriptionSocial","")
+            published  = job.get("publishedDate", "") or job.get("updatedAt", "")
+            if not is_recent(timestamp_str=published):
+                continue
             if matches(title) or matches(descr):
                 job_id = job.get("id", "")
                 handle_job(
@@ -688,7 +748,8 @@ def scan_ashby(company: str):
 def scan_workday(display_name: str, tenant: str):
     """
     Workday: POST-based search API with keyword 'snowflake'.
-    Tries multiple subdomain patterns (wd1/wd3/wd5) until one works.
+    Workday does not return posted dates in the list API so we
+    use the seen_jobs deduplication to avoid re-alerting old jobs.
     """
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     payload = {
@@ -713,16 +774,12 @@ def scan_workday(display_name: str, tenant: str):
                             display_name, title, apply,
                             "Workday"
                         )
-                return   # Success — stop trying other subdomain patterns
+                return
         except Exception:
             pass
 
 def scan_the_muse():
-    """
-    The Muse — 100% FREE, unlimited, no key needed.
-    Bonus aggregator that covers tech companies not on the other ATS.
-    Runs on every scan cycle.
-    """
+    """The Muse — FREE unlimited. Filters by date where possible."""
     try:
         r = requests.get(
             "https://www.themuse.com/api/public/jobs",
@@ -730,12 +787,15 @@ def scan_the_muse():
             timeout=REQUEST_TIMEOUT
         )
         for job in r.json().get("results", []):
-            title   = job.get("name", "")
-            company = job.get("company", {}).get("name", "")
-            apply   = job.get("refs", {}).get("landing_page", "")
-            locs    = job.get("locations", [])
-            loc     = locs[0].get("name", "") if locs else ""
-            job_id  = job.get("id", title)
+            title      = job.get("name", "")
+            company    = job.get("company", {}).get("name", "")
+            apply      = job.get("refs", {}).get("landing_page", "")
+            locs       = job.get("locations", [])
+            loc        = locs[0].get("name", "") if locs else ""
+            job_id     = job.get("id", title)
+            published  = job.get("publication_date", "")
+            if not is_recent(timestamp_str=published):
+                continue
             if matches(title):
                 handle_job(f"muse_{job_id}", company, title, apply, "The Muse", loc)
     except Exception as e:
